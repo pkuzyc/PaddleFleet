@@ -15,14 +15,21 @@
 
 from __future__ import annotations
 
+import copy
+import functools
 import random
 import unittest
 
 import numpy as np
 import paddle
+from paddle.distributed import fleet
+from paddle.distributed.fleet.utils import mix_precision_utils
 
-from paddlefleet.fp8 import FP8Linear
+from paddlefleet.fp8 import FP8ColumnParallelLinear
 from paddlefleet.fp8.utils import is_fp8_tensor
+from paddlefleet.gpt_builders import gpt_builder
+from paddlefleet.models.gpt import GPTConfig
+from paddlefleet.pipeline_parallel import NoPipelineParallel
 from paddlefleet.tensor_parallel import ColumnParallelLinear
 from paddlefleet.transformer.transformer_config import TransformerConfig
 
@@ -36,6 +43,12 @@ def calc_diff(x: paddle.Tensor, y: paddle.Tensor):
     return 1 - sim
 
 
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    paddle.seed(seed)
+
+
 class TestParallelMLP(unittest.TestCase):
     def setUp(self):
         self.config = TransformerConfig(
@@ -46,10 +59,8 @@ class TestParallelMLP(unittest.TestCase):
             use_cpu_initialization=True,
         )
 
-        paddle.manual_seed(123)
-        np.random.seed(123)
-        random.seed(123)
-        self.fp8_linear = FP8Linear(
+        set_seed(123)
+        self.fp8_linear = FP8ColumnParallelLinear(
             self.config.hidden_size,
             self.config.intermediate_size,
             config=self.config,
@@ -61,14 +72,9 @@ class TestParallelMLP(unittest.TestCase):
             level="O2",
             dtype="bfloat16",
         )
-        # self.fp8_linear.weight = paddle.nn.parameter.Parameter(
-        #     self.fp8_linear.weight.T.contiguous().T
-        # )
         self.fp8_linear.weight.main_grad = None
 
-        paddle.manual_seed(123)
-        np.random.seed(123)
-        random.seed(123)
+        set_seed(123)
         # self.fp32_linear = paddle.nn.Linear(self.config.hidden_size, self.config.intermediate_size, bias_attr=False)
         self.fp32_linear = ColumnParallelLinear(
             self.config.hidden_size,
@@ -116,7 +122,7 @@ class TestParallelMLP(unittest.TestCase):
             out_fp32, _ = self.fp32_linear(pd_x_fp32)
             out_fp32.sum().backward()
 
-            out_fp8 = self.fp8_linear(pd_x_bf16)
+            out_fp8, _ = self.fp8_linear(pd_x_bf16)
             out_fp8.sum().backward()
 
             out_diff = calc_diff(out_fp32, out_fp8)
@@ -132,7 +138,80 @@ class TestParallelMLP(unittest.TestCase):
             assert x_grad_diff < 0.001, (
                 f"iter {i} failed, x_grad_diff: {x_grad_diff}"
             )
-            # paddle.cuda.nvtx.range_pop()
+
+    def test_transformer_layer(self):
+        vocab_size = 12800
+        seq_len = 4096
+        batch_size = 2
+        fp32_config = GPTConfig(
+            vocab_size=vocab_size,
+            max_sequence_length=seq_len,
+            num_hidden_layers=2,
+            hidden_size=self.config.hidden_size,
+            num_attention_heads=4,
+            intermediate_size=self.config.intermediate_size,
+            normalization="RMSNorm",
+            hidden_dropout_prob=0.0,
+            attention_dropout=0.0,
+            use_cpu_initialization=True,
+            parallel_output=True,
+            tie_word_embeddings=True,
+            position_embedding_type="rope",
+            rotary_percent=1.0,
+            rotary_base=10000,
+            rope_scaling=1.0,
+            init_method=functools.partial(
+                paddle.nn.init.xavier_uniform_, gain=1.0
+            ),
+            output_layer_init_method=functools.partial(
+                paddle.nn.init.xavier_uniform_, gain=1.0
+            ),
+            use_qk_norm=True,
+        )
+
+        fp8_config = copy.deepcopy(fp32_config)
+        fp8_config.fp8 = "e4m3"
+        fp8_config.fp8_linear = True
+
+        set_seed(46)
+        fp32_gpt_model = gpt_builder(fp32_config, num_stages=1)
+        set_seed(46)
+        fp8_gpt_model = gpt_builder(fp8_config, num_stages=1)
+        paddle.amp.decorate(
+            models=fp8_gpt_model,
+            level="O2",
+            dtype="bfloat16",
+            master_grad=True,
+        )
+        mix_precision_utils.MixPrecisionLayer(fp8_gpt_model, "bfloat16")
+
+        strategy = fleet.DistributedStrategy()
+        fp32_gpt_model = NoPipelineParallel(fp32_gpt_model, strategy)
+        fp8_gpt_model = NoPipelineParallel(fp8_gpt_model, strategy)
+
+        for i in range(self.acc_step):
+            data = paddle.randint(
+                low=0, high=vocab_size, shape=(batch_size, seq_len + 1)
+            )
+
+            input_ids = data[:, :-1]
+            labels = data[:, 1:]
+            position_ids = paddle.to_tensor(data, dtype=paddle.int64).repeat(
+                (batch_size, 1)
+            )
+            inputs = (
+                {
+                    "input_ids": [input_ids],
+                    "position_ids": [position_ids],
+                },
+                [labels],
+            )
+            fp32_loss = fp32_gpt_model.forward_backward_pipeline(inputs)
+            fp8_loss = fp8_gpt_model.forward_backward_pipeline(inputs)
+
+            assert fp32_loss - fp8_loss < 1e-3, (
+                f"iter {i} failed, fp32_loss: {fp32_loss}, fp8_loss: {fp8_loss}"
+            )
 
 
 if __name__ == "__main__":

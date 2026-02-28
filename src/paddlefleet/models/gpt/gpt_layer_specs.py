@@ -103,6 +103,7 @@ def get_gpt_layer_local_spec(
         backend=backend,
         num_experts=num_experts,
         moe_grouped_gemm=moe_grouped_gemm,
+        config=config,
     )
     transformer_cls = getattr(config, "specific_layer", TransformerLayer)
     if paddle.distributed.is_initialized():
@@ -115,6 +116,7 @@ def get_gpt_layer_local_spec(
             )
             transformer_cls = TransformerLayerWithOverlap
 
+    fp8_linear = config.fp8_linear and config.fp8 == "e4m3"
     return LayerSpec(
         layer=transformer_cls,
         sublayers_spec=TransformerLayerSublayersSpec(
@@ -123,9 +125,9 @@ def get_gpt_layer_local_spec(
                 layer=SelfAttention,
                 extra_kwargs={"attn_mask_type": AttnMaskType.causal},
                 sublayers_spec=SelfAttentionSublayersSpec(
-                    qkv_proj=backend.column_parallel_linear(),
+                    qkv_proj=backend.column_parallel_linear(fp8_linear),
                     core_attention=backend.core_attention(),
-                    o_proj=backend.row_parallel_linear(),
+                    o_proj=backend.row_parallel_linear(fp8_linear),
                     q_norm=(
                         L2Norm
                         if qk_l2_norm
@@ -161,10 +163,14 @@ def get_mlp_layer_spec_for_backend(
     backend: BackendSpecProvider,
     num_experts: int | None = None,
     moe_grouped_gemm: bool | None = False,
+    config: TransformerConfig | None = None,
 ) -> LayerSpec:
     """Helper function to get layer spec for MLP/MoE"""
 
-    down_proj = backend.row_parallel_linear()
+    fp8_linear = False
+    if config is not None:
+        fp8_linear = config.fp8_linear and config.fp8 == "e4m3"
+    down_proj = backend.row_parallel_linear(fp8_linear)
     hidden_act = None
 
     if num_experts is None:
@@ -174,7 +180,7 @@ def get_mlp_layer_spec_for_backend(
             up_gate_proj = backend.column_parallel_layer_norm_linear()
             assert up_gate_proj is not None
         else:
-            up_gate_proj = backend.column_parallel_linear()
+            up_gate_proj = backend.column_parallel_linear(fp8_linear)
         return LayerSpec(
             layer=layer,
             sublayers_spec=MLPSublayersSpec(

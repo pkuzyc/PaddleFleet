@@ -413,6 +413,9 @@ class TransformerConfig(ModelParallelConfig):
     fp8_wgrad: bool = True
     """Whether to use fp8 wgrad."""
 
+    fp8_linear: bool = False
+    """Whether to use fp8 linear. Temporary used for experiment."""
+
     ####################
     # initialization
     ####################

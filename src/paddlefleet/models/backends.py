@@ -18,6 +18,7 @@ from __future__ import annotations
 from abc import abstractmethod
 from typing import Protocol
 
+from paddlefleet.fp8 import FP8ColumnParallelLinear, FP8RowParallelLinear
 from paddlefleet.parallel_state import (
     get_context_parallel_group,
     get_context_parallel_world_size,
@@ -100,12 +101,16 @@ class BackendSpecProvider(Protocol):
 class LocalSpecProvider(BackendSpecProvider):
     """A protocol for providing Local sublayers_spec used in Spec building."""
 
-    def column_parallel_linear(self) -> type:
+    def column_parallel_linear(self, use_fp8=False) -> type:
         """Which column parallel linear layer the backend uses"""
+        if use_fp8:
+            return FP8ColumnParallelLinear
         return ColumnParallelLinear
 
-    def row_parallel_linear(self) -> type:
+    def row_parallel_linear(self, use_fp8=False) -> type:
         """Which row parallel linear layer the backend uses"""
+        if use_fp8:
+            return FP8RowParallelLinear
         return RowParallelLinear
 
     def fuse_layernorm_and_linear(self) -> bool:

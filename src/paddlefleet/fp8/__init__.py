@@ -12,6 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .linear import FP8Linear
+from .linear import FP8ColumnParallelLinear, FP8RowParallelLinear
 
-__all__ = ["FP8Linear"]
+__all__ = ["FP8ColumnParallelLinear", "FP8RowParallelLinear"]

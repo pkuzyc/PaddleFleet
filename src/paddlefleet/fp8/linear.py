@@ -17,7 +17,7 @@ import paddle
 from paddle.nn.parameter import Parameter
 
 from paddlefleet.ops import deep_gemm
-from paddlefleet.tensor_parallel import ColumnParallelLinear
+from paddlefleet.tensor_parallel import ColumnParallelLinear, RowParallelLinear
 
 from .quantization import get_quant_func
 from .utils import is_fp8_tensor
@@ -56,6 +56,7 @@ class _FP8Gemm(paddle.autograd.Function):
         ctx.save_for_backward(
             inp_t_fp8, inp_t_scale, weight, weight_fp8, weight_scale
         )
+
         out = paddle.empty(
             [inp_fp8.shape[0], weight_fp8.shape[0]], dtype=paddle.bfloat16
         )
@@ -144,7 +145,7 @@ class _FP8Gemm(paddle.autograd.Function):
         return grad_input, None
 
 
-class FP8Linear(ColumnParallelLinear):
+class FP8ColumnParallelLinear(ColumnParallelLinear):
     """FP8 Linear"""
 
     def __init__(
@@ -186,22 +187,103 @@ class FP8Linear(ColumnParallelLinear):
             tp_group=tp_group,
         )
 
-        # DeepGEMM requires k-major storage, here to make self.weight k-major
-        # and keep its shape consistent with [k, m]
-        # print("==== self.weight before ====")
-        # print(self.weight.strides)
         self.weight = Parameter(self.weight.T.contiguous())
-        # print("==== self.weight after ====")
-        # print(self.weight.strides)
 
         self.inp_quant_func, self.weight_quant_func = get_quant_func(
             config.fp8_recipe, input_trans=True, out_scale_trans=False
         )
 
     def forward(self, inp):
+        # TODO: quant function supports float32 input
+        if inp.dtype == paddle.float32:
+            inp = inp.cast(paddle.bfloat16)
+
+        out_shape = None
+        if inp.ndim == 3:
+            out_shape = [*inp.shape[:-1], self.weight.shape[0]]
+            inp = inp.reshape([-1, inp.shape[-1]])
+
+        bias = self.bias if not self.skip_bias_add else None
+
         out = _FP8Gemm.apply(
             inp, self.weight, self.inp_quant_func, self.weight_quant_func
         )
-        if self.bias is not None:
-            out = out + self.bias
-        return out
+
+        if bias is not None:
+            out = out + bias
+
+        if out_shape is not None:
+            out = out.reshape(out_shape)
+
+        output_bias = self.bias if self.skip_bias_add else None
+
+        return out, output_bias
+
+
+class FP8RowParallelLinear(RowParallelLinear):
+    """
+    FP8 Linear with row parallelism.
+    """
+
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        *,
+        config,
+        init_method: callable,
+        bias: bool = True,
+        input_is_parallel: bool = False,
+        skip_bias_add: bool = False,
+        stride: int = 1,
+        keep_master_weight_for_test: bool = False,
+        is_expert: bool = False,
+        tp_comm_buffer_name: str | None = None,  # Not used
+        tp_group: paddle.core.ProcessGroup | None = None,
+    ):
+        super().__init__(
+            input_size,
+            output_size,
+            config=config,
+            init_method=init_method,
+            bias=bias,
+            input_is_parallel=input_is_parallel,
+            skip_bias_add=skip_bias_add,
+            stride=stride,
+            keep_master_weight_for_test=keep_master_weight_for_test,
+            is_expert=is_expert,
+            tp_comm_buffer_name=tp_comm_buffer_name,
+            tp_group=tp_group,
+        )
+
+        # DeepGEMM requires k-major storage
+        self.weight = Parameter(self.weight.T.contiguous())
+
+        self.inp_quant_func, self.weight_quant_func = get_quant_func(
+            config.fp8_recipe, input_trans=True, out_scale_trans=False
+        )
+
+    def forward(self, inp):
+        # TODO: quant function supports float32 input
+        if inp.dtype == paddle.float32:
+            inp = inp.cast(paddle.bfloat16)
+
+        out_shape = None
+        if inp.ndim == 3:
+            out_shape = [*inp.shape[:-1], self.weight.shape[0]]
+            inp = inp.reshape([-1, inp.shape[-1]])
+
+        bias = self.bias if not self.skip_bias_add else None
+
+        out = _FP8Gemm.apply(
+            inp, self.weight, self.inp_quant_func, self.weight_quant_func
+        )
+        if bias is not None:
+            out = out + bias
+
+        if out_shape is not None:
+            out = out.reshape(out_shape)
+
+        output_bias = self.bias if self.skip_bias_add else None
+
+        return out, output_bias
