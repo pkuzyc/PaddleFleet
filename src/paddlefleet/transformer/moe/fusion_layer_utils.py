@@ -2175,6 +2175,180 @@ class HybridEPMoePyLayer(paddle.autograd.PyLayer):
         return hidden_states_grad, dispatched_probs_grad
 
 
+class _SonicProjectionCtx:
+    def save_for_backward(self, *args):
+        self._saved = args
+
+    def saved_tensor(self):
+        return self._saved
+
+    def mark_non_differentiable(self, *args):
+        pass
+
+    def set_materialize_grads(self, value):
+        pass
+
+
+class _SonicMoEGroupedFunc(paddle.autograd.PyLayer):
+    @staticmethod
+    def forward(
+        ctx,
+        hidden_states,
+        topk_indices,
+        topk_scores,
+        w1,
+        w2,
+        w1_main_grad,
+        w2_main_grad,
+        fp8_scale,
+        K,
+        E,
+        fp8,
+        tokens_per_expert,
+        fp8_combine_grad_handle,
+    ):
+        T = hidden_states.shape[0]
+        stream_id = paddle.device.current_stream()
+
+        if tokens_per_expert is None:
+            valid = topk_indices >= 0
+            valid_experts = topk_indices[valid].cast(paddle.int32)
+            tokens_per_expert = paddle.bincount(
+                valid_experts, minlength=E
+            ).cast(paddle.int32)
+
+        (
+            expert_frequency_offset,
+            x_gather_idx,
+            s_scatter_idx,
+            s_reverse_scatter_idx,
+            num_activated_expert_per_token_offset,
+            _router_scores,
+            TK_padded,
+            total_pad_rows,
+            _N_recv,
+            _score_src_idx,
+            expert_order_scores,
+        ) = deepep_topk_to_sonic_metadata(
+            topk_indices.cast(paddle.int32),
+            topk_scores,
+            tokens_per_expert,
+            E,
+            block=128 if fp8 else 1,
+        )
+
+        s_scatter_idx.stop_gradient = True
+        topk_scores.stop_gradient = False
+        activation_type = ActivationType("swiglu")
+
+        router_scores_token_order = _differentiable_router_scores(
+            topk_scores,
+            topk_indices.cast(paddle.int32),
+            num_activated_expert_per_token_offset,
+            TK_padded - total_pad_rows,
+            TK_padded,
+            E,
+            score_src_idx=_score_src_idx,
+        )
+
+        fp8_hidden_states = None
+        if fp8_scale is not None:
+            fp8_hidden_states = (hidden_states, fp8_scale)
+
+        w1_sonic = w1.permute([1, 2, 0])
+        w2_sonic = w2.permute([1, 2, 0])
+        if fp8:
+            for attr_name in ("fp8", "transposed_fp8"):
+                if hasattr(w1, attr_name):
+                    setattr(w1_sonic, attr_name, getattr(w1, attr_name))
+                if hasattr(w2, attr_name):
+                    setattr(w2_sonic, attr_name, getattr(w2, attr_name))
+
+        up_ctx = _SonicProjectionCtx()
+        down_ctx = _SonicProjectionCtx()
+        with enable_fp8(fp8):
+            _refresh_fp8_config()
+            y1, z = _UpProjection.forward(
+                up_ctx,
+                hidden_states,
+                w1_sonic,
+                None,
+                expert_frequency_offset,
+                TK_padded,
+                K,
+                stream_id,
+                x_gather_idx,
+                s_scatter_idx,
+                s_reverse_scatter_idx,
+                num_activated_expert_per_token_offset,
+                True,
+                activation_type,
+                False,
+                False,
+                fp8_hidden_states,
+            )
+            output = _DownProjection.forward(
+                down_ctx,
+                y1,
+                z,
+                w2_sonic,
+                None,
+                topk_scores,
+                s_scatter_idx,
+                expert_frequency_offset,
+                T,
+                K,
+                stream_id,
+                x_gather_idx,
+                s_scatter_idx,
+                s_reverse_scatter_idx,
+                num_activated_expert_per_token_offset,
+                True,
+                activation_type,
+                None,
+                fp8_combine_grad_handle,
+                expert_order_scores,
+                router_scores_token_order,
+                _score_src_idx,
+            )
+            down_ctx._topk_scores_needs_grad = True
+
+        ctx._up_ctx = up_ctx
+        ctx._down_ctx = down_ctx
+        ctx._w1_main_grad = w1_main_grad
+        ctx._w2_main_grad = w2_main_grad
+        ctx._fp8_combine_grad_handle = fp8_combine_grad_handle
+        return output
+
+    @staticmethod
+    def backward(ctx, output_grad):
+        down_ctx = ctx._down_ctx
+        up_ctx = ctx._up_ctx
+
+        down_ctx._wgrad_w2_accumulator = ctx._w2_main_grad
+        down_grads = _DownProjection.backward(down_ctx, output_grad)
+        dz = down_grads[1]
+        dw2 = down_grads[2]
+        ds_idx = 4 if getattr(down_ctx, "_has_b2", False) else 3
+        ds = down_grads[ds_idx]
+
+        up_ctx._wgrad_w1_accumulator = ctx._w1_main_grad
+        up_grads = _UpProjection.backward(up_ctx, None, dz)
+        dx = up_grads[0]
+        dw1 = up_grads[1]
+
+        if dw1 is not None:
+            dw1 = dw1.permute([2, 1, 0])
+        if dw2 is not None:
+            dw2 = dw2.permute([2, 1, 0])
+
+        if ctx._fp8_combine_grad_handle is not None:
+            ctx._fp8_combine_grad_handle.pop("data", None)
+            ctx._fp8_combine_grad_handle.pop("scale", None)
+
+        return dx, None, ds, dw1, dw2, None, None, None
+
+
 def run_sonic_moe(
     hidden_states,
     topk_indices,
@@ -2188,105 +2362,27 @@ def run_sonic_moe(
     fp8_scale=None,
     fp8_combine_grad_handle=None,
 ):
-    T = hidden_states.shape[0]
-    stream_id = paddle.device.current_stream()
+    w1_main_grad = getattr(w1, "main_grad", None)
+    w2_main_grad = getattr(w2, "main_grad", None)
+    if w1_main_grad is None:
+        w1_main_grad = paddle.zeros(w1.shape, dtype=paddle.float32)
+        w1.main_grad = w1_main_grad
+    if w2_main_grad is None:
+        w2_main_grad = paddle.zeros(w2.shape, dtype=paddle.float32)
+        w2.main_grad = w2_main_grad
 
-    if tokens_per_expert is None:
-        valid = topk_indices >= 0
-        valid_experts = topk_indices[valid].cast(paddle.int32)
-        tokens_per_expert = paddle.bincount(valid_experts, minlength=E).cast(
-            paddle.int32
-        )
-
-    (
-        expert_frequency_offset,
-        x_gather_idx,
-        s_scatter_idx,
-        s_reverse_scatter_idx,
-        num_activated_expert_per_token_offset,
-        _router_scores,
-        TK_padded,
-        total_pad_rows,
-        _N_recv,
-        _score_src_idx,
-        expert_order_scores,
-    ) = deepep_topk_to_sonic_metadata(
-        topk_indices.cast(paddle.int32),
+    return _SonicMoEGroupedFunc.apply(
+        hidden_states,
+        topk_indices,
         topk_scores,
+        w1,
+        w2,
+        w1_main_grad,
+        w2_main_grad,
+        fp8_scale,
+        K,
+        E,
+        fp8,
         tokens_per_expert,
-        E,
-        block=128 if fp8 else 1,
+        fp8_combine_grad_handle,
     )
-
-    s_scatter_idx.stop_gradient = True
-    activation_type = ActivationType("swiglu")
-
-    total_expert_freq = TK_padded
-    router_scores_token_order = _differentiable_router_scores(
-        topk_scores,
-        topk_indices.cast(paddle.int32),
-        num_activated_expert_per_token_offset,
-        TK_padded - total_pad_rows,
-        TK_padded,
-        E,
-        score_src_idx=_score_src_idx,
-    )
-
-    fp8_hidden_states = None
-    if fp8_scale is not None:
-        fp8_hidden_states = (hidden_states, fp8_scale)
-
-    w1_sonic = w1.permute([1, 2, 0])
-    w2_sonic = w2.permute([1, 2, 0])
-    if fp8:
-        for attr_name in ("fp8", "transposed_fp8"):
-            if hasattr(w1, attr_name):
-                setattr(w1_sonic, attr_name, getattr(w1, attr_name))
-            if hasattr(w2, attr_name):
-                setattr(w2_sonic, attr_name, getattr(w2, attr_name))
-
-    with enable_fp8(fp8):
-        _refresh_fp8_config()
-        y1, z = _UpProjection.apply(
-            hidden_states,
-            w1_sonic,
-            None,
-            expert_frequency_offset,
-            total_expert_freq,
-            K,
-            stream_id,
-            x_gather_idx,
-            s_scatter_idx,
-            s_reverse_scatter_idx,
-            num_activated_expert_per_token_offset,
-            True,  # is_varlen_k
-            activation_type,
-            is_inference_mode_enabled=False,
-            use_low_precision_postact_buffer=False,
-            prequant_activation_payload=fp8_hidden_states,
-        )
-        hidden_states = _DownProjection.apply(
-            y1,
-            z,
-            w2_sonic,
-            None,
-            topk_scores,
-            s_scatter_idx,
-            expert_frequency_offset,
-            T,
-            K,
-            stream_id,
-            x_gather_idx,
-            s_scatter_idx,
-            s_reverse_scatter_idx,
-            num_activated_expert_per_token_offset,
-            True,  # is_varlen_k
-            activation_type,
-            None,
-            fp8_combine_grad_handle,
-            expert_order_scores,
-            router_scores_token_order,
-            _score_src_idx,
-        )
-
-    return hidden_states

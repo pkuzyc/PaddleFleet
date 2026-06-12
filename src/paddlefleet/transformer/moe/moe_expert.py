@@ -425,6 +425,15 @@ class SonicMoEExpert(GroupedMLPExpert):
     def flush_to_grouped_layout(self):
         self.convert_weights_to_grouped_layout()
 
+    def enable_async_master_offload(self, enabled):
+        if enabled:
+            raise RuntimeError(
+                "SonicMoE async master offload is not supported in Fleet."
+            )
+
+    def restore_master_weight_for_optimizer(self):
+        self.flush_to_grouped_layout()
+
     def step(self):
         self.flush_to_grouped_layout()
 
