@@ -2206,6 +2206,7 @@ class _SonicMoEGroupedFunc(paddle.autograd.PyLayer):
         fp8,
         tokens_per_expert,
         fp8_combine_grad_handle,
+        topk_scores_needs_grad,
     ):
         T = hidden_states.shape[0]
         stream_id = paddle.device.current_stream()
@@ -2311,12 +2312,14 @@ class _SonicMoEGroupedFunc(paddle.autograd.PyLayer):
                 router_scores_token_order,
                 _score_src_idx,
             )
-            down_ctx._topk_scores_needs_grad = True
+            down_ctx._topk_scores_needs_grad = topk_scores_needs_grad
 
         ctx._up_ctx = up_ctx
         ctx._down_ctx = down_ctx
         ctx._w1_main_grad = w1_main_grad
         ctx._w2_main_grad = w2_main_grad
+        ctx._topk_scores = topk_scores
+        ctx._topk_scores_needs_grad = topk_scores_needs_grad
         ctx._fp8_combine_grad_handle = fp8_combine_grad_handle
         return output
 
@@ -2331,6 +2334,8 @@ class _SonicMoEGroupedFunc(paddle.autograd.PyLayer):
         dw2 = down_grads[2]
         ds_idx = 4 if getattr(down_ctx, "_has_b2", False) else 3
         ds = down_grads[ds_idx]
+        if ds is None and ctx._topk_scores_needs_grad:
+            ds = paddle.zeros_like(ctx._topk_scores)
 
         up_ctx._wgrad_w1_accumulator = ctx._w1_main_grad
         up_grads = _UpProjection.backward(up_ctx, None, dz)
@@ -2371,6 +2376,8 @@ def run_sonic_moe(
         w2_main_grad = paddle.zeros(w2.shape, dtype=paddle.float32)
         w2.main_grad = w2_main_grad
 
+    topk_scores_needs_grad = not topk_scores.stop_gradient
+
     return _SonicMoEGroupedFunc.apply(
         hidden_states,
         topk_indices,
@@ -2385,4 +2392,5 @@ def run_sonic_moe(
         fp8,
         tokens_per_expert,
         fp8_combine_grad_handle,
+        topk_scores_needs_grad,
     )
